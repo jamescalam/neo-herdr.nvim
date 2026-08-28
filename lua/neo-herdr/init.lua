@@ -49,6 +49,7 @@ M.config = {
     editor = true, -- include an editor/cursor window taking the remaining width
     hide_tab = true, -- hide the herd tabpage from the built-in tabline (see README)
     help = true, -- show the keybindings help pane under the chat (toggle with ?)
+    notifier = true, -- Opera-GX-style notifier float (blocked/working/done circles)
     use_socket = true, -- prefer socket; falls back to CLI poll
     socket_path = nil, -- override $HERDR_SOCKET_PATH resolution
     auto_refresh = true, -- timer + manual; false = manual only
@@ -220,64 +221,50 @@ function M.rename_chat(agent)
   end)
 end
 
--- Start an agent in a known (or soon-to-be-ready) pane, waiting for its shell
--- to reach a prompt first — a freshly created tab isn't an "available shell"
--- for ~0.5s. cb optional.
-local function start_agent_in_pane(pane_id, kind, name, cb)
+-- herdr agent names must be lowercase [a-z0-9_-], 1-32 chars, starting with a
+-- letter. Coerce free-form input into a valid name (else the CLI rejects it).
+local function sanitize_name(s)
+  s = (s or ""):lower():gsub("[^a-z0-9_-]", "-"):gsub("^[^a-z]+", ""):sub(1, 32)
+  return s
+end
+
+-- Start an agent in a freshly created tab's pane, waiting for its shell to reach
+-- a prompt first — a new tab isn't an "available shell" for ~0.5s.
+local function start_agent_in_pane(pane_id, kind, name)
   herdr.wait_pane_ready(pane_id, function(ready)
     if not ready then
-      notify("pane's shell never became ready", vim.log.levels.ERROR)
+      notify("the new tab's shell never reached a prompt", vim.log.levels.ERROR)
       return
     end
     herdr.start_agent(pane_id, kind, name, 60000, function(ok, out)
+      out = out or ""
       if ok then
         notify("started " .. name .. " (" .. kind .. ")")
         require("neo-herdr.dashboard").refresh()
-        if cb then
-          cb(pane_id)
-        end
+      elseif out:find("agent_name_taken") then
+        notify("name '" .. name .. "' is already taken — pick another", vim.log.levels.ERROR)
+      elseif out:find("invalid_agent_name") then
+        notify("invalid agent name '" .. name .. "' (use a-z, 0-9, -, _)", vim.log.levels.ERROR)
       else
-        notify("agent start failed: " .. (out or "unknown"), vim.log.levels.ERROR)
+        notify("agent start failed: " .. out, vim.log.levels.ERROR)
       end
     end)
   end)
 end
 
--- Create a plain terminal (a tab with a shell pane, no agent). Shows up in the
--- nav as a "terminal" row you can later start an agent in (n) or close (x).
-local function new_terminal(ws)
-  herdr.create_tab({ workspace_id = ws, focus = true }, function(info, err)
-    if not info or not info.pane_id then
-      notify("terminal create failed: " .. (err or "no pane id"), vim.log.levels.ERROR)
-      return
-    end
-    notify("new terminal (no agent)")
-    require("neo-herdr.dashboard").refresh()
-  end)
-end
-
---- Create a new chat: new tab → wait for its shell → start an agent in it.
---- Enter `terminal` (or `shell`/`none`) as the kind to get a plain terminal
---- session with no agent loaded. ctx (optional) = the hovered row; on an idle
---- shell ("terminal") row we reuse that pane instead of creating a new tab.
+--- Create a new agent chat: make a fresh tab and start an agent in it. ctx
+--- (optional) = the hovered row, used only to default the kind/workspace.
 function M.new_chat(ctx)
-  local reuse_pane = (type(ctx) == "table" and ctx.is_shell) and ctx.pane_id or nil
   local ws = type(ctx) == "table" and ctx.workspace_id or nil
   local default_kind = (type(ctx) == "table" and not ctx.is_shell and ctx.program) or "claude"
-  vim.ui.input({ prompt = "Agent kind (or 'terminal' for no agent): ", default = default_kind }, function(kind)
+  vim.ui.input({ prompt = "Agent kind: ", default = default_kind }, function(kind)
     if not kind or kind == "" then
       return
     end
-    local low = kind:lower()
-    if low == "terminal" or low == "shell" or low == "none" then
-      new_terminal(ws) -- plain shell tab; hovered-shell reuse doesn't apply
-      return
-    end
-    vim.ui.input({ prompt = "Name: ", default = kind }, function(name)
-      name = (name and name ~= "") and name or kind
-      if reuse_pane then
-        -- Hovered an existing "terminal" (shell) row → start the agent there.
-        start_agent_in_pane(reuse_pane, kind, name)
+    vim.ui.input({ prompt = "Name: ", default = kind }, function(rawname)
+      local name = sanitize_name((rawname and rawname ~= "") and rawname or kind)
+      if name == "" then
+        notify("could not derive a valid agent name", vim.log.levels.ERROR)
         return
       end
       herdr.create_tab({ workspace_id = ws, focus = true }, function(info, err)

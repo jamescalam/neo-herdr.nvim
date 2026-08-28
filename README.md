@@ -60,6 +60,14 @@ The dividers between the herd tab's windows are drawn **dotted** (nvim calls
 these "windows"; "pane" is tmux's term) to signal they're one grouped area,
 distinct from the solid separators in your normal tabs.
 
+A small **notifier** pill (Opera-GX style) floats at the left edge of the chat —
+a narrow, fixed, non-focusable, **transparent** rounded outline (it blends with
+the editor like any window) holding three circles that aggregate the whole
+herd's state: top `●` **red** if any agent is blocked, mid `●` **amber** if any
+is working, bottom `●` **green** if any is done (empty `○` otherwise). The
+outline follows your `WinSeparator` color; disable with
+`dashboard.notifier = false`.
+
 Agents are labelled by their live terminal title; the focused agent is marked
 `▸`. The status glyph is **colored by state** (like herdr's own UI): amber
 `●` working · grey `○` idle · red `◉` blocked · green `✓` done · dim `·` no
@@ -72,17 +80,16 @@ poll as a backstop; the header shows `socket ●` (live events), `socket`, or
 The nav lists **panes**, not just running agents — the same set herdr shows as
 tabs. When an agent exits (e.g. `claude` `/exit`), herdr keeps its pane alive as
 a plain shell, so the row **stays** in the nav labelled `terminal` (with its
-short pane id, e.g. `p1D`, in the right column) instead of vanishing. You can
-still `x` to close it, or `n` on it to start a fresh agent in that same shell
-(rather than opening a new tab). Agent rows sort above `terminal` rows within
-each workspace.
+short pane id, e.g. `p1D`, in the right column) instead of vanishing — you can
+still `<CR>` to view it or `x` to close it. Agent rows sort above `terminal`
+rows within each workspace.
 
 Row actions (cursor on an agent):
 
 | Key   | Action                                                        |
 | ----- | ------------------------------------------------------------- |
 | `<CR>`| Open the agent's live chat in the chat window (reuses it)     |
-| `n`   | New chat — new tab + agent (enter `terminal` as the kind for a plain shell, no agent); on a `terminal` row, reuse that shell |
+| `n`   | New chat — create a fresh tab and start an agent in it (prompts kind/name)|
 | `x`   | Close this chat / terminal (`herdr pane close`, with a confirm) |
 | `c`   | Rename this chat (`herdr agent rename`)                       |
 | `p`   | Prompt the agent                                              |
@@ -153,6 +160,7 @@ require("neo-herdr").setup({
     editor = true,        -- include an editor/cursor window taking the rest
     hide_tab = true,      -- hide the herd tabpage from the built-in tabline
     help = true,          -- keybindings help pane under the chat (toggle with ?)
+    notifier = true,      -- Opera-GX-style notifier float (blocked/working/done)
     use_socket = true,    -- prefer socket; false = CLI poll only
     socket_path = nil,    -- override $HERDR_SOCKET_PATH resolution
     auto_refresh = true,  -- timer + manual; false = manual only

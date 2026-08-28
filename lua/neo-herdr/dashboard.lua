@@ -9,6 +9,7 @@ local M = {}
 
 local NS = vim.api.nvim_create_namespace("neo_herdr_dashboard")
 local HELP_NS = vim.api.nvim_create_namespace("neo_herdr_help")
+local STATUS_NS = vim.api.nvim_create_namespace("neo_herdr_notifier")
 
 local D = {
   win = nil,
@@ -66,6 +67,10 @@ local function define_highlights()
   link("NeoHerdrWs", "Directory")
   link("NeoHerdrProgram", "Comment")
   link("NeoHerdrDim", "NonText")
+  -- Notifier (Opera-GX-style pill): transparent inside (inherits Normal); only
+  -- the rounded outline and the circles carry color.
+  link("NeoHerdrNotifierEdge", "WinSeparator") -- rounded ╭╮╰╯│─ outline
+  link("NeoHerdrNotifierOff", "NonText") -- empty ○ circle
 end
 
 -- ── Controller: keep `state` fresh from socket + poll ──────────────────────
@@ -227,6 +232,180 @@ update_chat_header = function()
   vim.wo[D.chat_win].winbar = table.concat(parts)
 end
 
+-- ── Notifier panel (Opera-GX-style) ─────────────────────────────────────────
+--
+-- A narrow, non-focusable, non-resizable, transparent float at the left edge of
+-- the chat window. It draws a rounded pill outline (╭╮╰╯│─) that blends with the
+-- editor and shows three circles that aggregate herd state:
+--   top  ● red   — some agent is blocked
+--   mid  ● amber — some agent is working
+--   bot  ● green — some agent is done
+-- otherwise the circle is an empty ○. It's a whole-herd notification at a glance.
+
+local NOTIFIER_W = 5 -- display columns
+local NOTIFIER_H = 7 -- rows
+
+-- Assemble one buffer line from { text, hl } segments; returns the string and a
+-- list of { col_start, col_end, hl } byte ranges (hl=nil segments are skipped).
+local function seg_line(segs)
+  local s, hls, col = "", {}, 0
+  for _, seg in ipairs(segs) do
+    local t = seg[1]
+    if seg[2] then
+      hls[#hls + 1] = { col, col + #t, seg[2] }
+    end
+    s = s .. t
+    col = col + #t
+  end
+  return s, hls
+end
+
+-- Which states exist across all agents right now.
+local function aggregate_states()
+  local blocked, working, done = false, false, false
+  for _, grp in ipairs(state.grouped()) do
+    for _, a in ipairs(grp.agents) do
+      local st = (a.status or ""):lower()
+      if st == "blocked" then
+        blocked = true
+      elseif st == "working" then
+        working = true
+      elseif st == "done" then
+        done = true
+      end
+    end
+  end
+  return blocked, working, done
+end
+
+local function ensure_status_buf()
+  if D.status_buf and vim.api.nvim_buf_is_valid(D.status_buf) then
+    return D.status_buf
+  end
+  local b = vim.api.nvim_create_buf(false, true)
+  vim.bo[b].buftype = "nofile"
+  vim.bo[b].bufhidden = "hide"
+  vim.bo[b].swapfile = false
+  vim.b[b].neo_herdr = true
+  D.status_buf = b
+  return b
+end
+
+-- Float geometry: sit just left of the chat window, overhanging the editor.
+local function status_geometry()
+  if not (D.chat_win and vim.api.nvim_win_is_valid(D.chat_win)) then
+    return nil
+  end
+  local pos = vim.api.nvim_win_get_position(D.chat_win) -- { row, col }
+  local col = pos[2] - NOTIFIER_W
+  if col < 0 then
+    col = 0
+  end
+  return {
+    relative = "editor",
+    row = pos[1],
+    col = col,
+    width = NOTIFIER_W,
+    height = NOTIFIER_H,
+    focusable = false,
+    style = "minimal",
+    border = "none",
+    zindex = 30,
+    noautocmd = true,
+  }
+end
+
+local update_status -- forward (M.render calls it)
+
+update_status = function()
+  if not (D.status_win and vim.api.nvim_win_is_valid(D.status_win)) then
+    return
+  end
+  if not (D.status_buf and vim.api.nvim_buf_is_valid(D.status_buf)) then
+    return
+  end
+  local blocked, working, done = aggregate_states()
+  local circles = {
+    { on = blocked, hl = "NeoHerdrBlocked" },
+    { on = working, hl = "NeoHerdrWorking" },
+    { on = done, hl = "NeoHerdrDone" },
+  }
+  local E = "NeoHerdrNotifierEdge"
+
+  local lines, all = {}, {}
+  local function push(s, hls)
+    lines[#lines + 1] = s
+    local r = #lines - 1
+    for _, h in ipairs(hls) do
+      all[#all + 1] = { r, h[1], h[2], h[3] }
+    end
+  end
+  -- A rounded pill outline (transparent inside) with a centered circle per row.
+  local function blank()
+    return seg_line({ { "│", E }, { "   " }, { "│", E } })
+  end
+  local function circle(c)
+    local glyph = c.on and "●" or "○"
+    local hl = c.on and c.hl or "NeoHerdrNotifierOff"
+    return seg_line({ { "│", E }, { " " }, { glyph, hl }, { " " }, { "│", E } })
+  end
+
+  local s, h
+  s, h = seg_line({ { "╭───╮", E } }) push(s, h)
+  s, h = circle(circles[1]) push(s, h)
+  s, h = blank() push(s, h)
+  s, h = circle(circles[2]) push(s, h)
+  s, h = blank() push(s, h)
+  s, h = circle(circles[3]) push(s, h)
+  s, h = seg_line({ { "╰───╯", E } }) push(s, h)
+
+  vim.bo[D.status_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(D.status_buf, 0, -1, false, lines)
+  vim.bo[D.status_buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(D.status_buf, STATUS_NS, 0, -1)
+  for _, a in ipairs(all) do
+    pcall(vim.api.nvim_buf_add_highlight, D.status_buf, STATUS_NS, a[4], a[1], a[2], a[3])
+  end
+end
+
+local function open_status(cfg)
+  if cfg and cfg.notifier == false then
+    return
+  end
+  if D.status_win and vim.api.nvim_win_is_valid(D.status_win) then
+    return
+  end
+  local g = status_geometry()
+  if not g then
+    return
+  end
+  local win = vim.api.nvim_open_win(ensure_status_buf(), false, g)
+  D.status_win = win
+  -- Transparent: inherit Normal so the float blends with the editor like any
+  -- other window; only the outline + circles carry color (via fg-only groups).
+  vim.wo[win].winhighlight = "NormalFloat:Normal,FloatBorder:Normal"
+  vim.wo[win].winfixwidth = true
+  vim.wo[win].winfixheight = true
+  update_status()
+end
+
+local function reposition_status()
+  if not (D.status_win and vim.api.nvim_win_is_valid(D.status_win)) then
+    return
+  end
+  local g = status_geometry()
+  if g then
+    pcall(vim.api.nvim_win_set_config, D.status_win, g)
+  end
+end
+
+local function close_status()
+  if D.status_win and vim.api.nvim_win_is_valid(D.status_win) then
+    pcall(vim.api.nvim_win_close, D.status_win, true)
+  end
+  D.status_win = nil
+end
+
 function M.render()
   if not (D.buf and vim.api.nvim_buf_is_valid(D.buf)) then
     return
@@ -304,6 +483,7 @@ function M.render()
   end
 
   update_chat_header()
+  update_status()
 end
 
 -- ── Row actions ─────────────────────────────────────────────────────────────
@@ -626,6 +806,18 @@ local function build_tab(cfg)
   end
 
   style_separators(cfg)
+  open_status(cfg) -- Opera-GX-style notifier float, left of the chat
+
+  -- Keep the notifier glued to the chat's left edge as the editor width changes.
+  -- A cleared augroup means re-opening the herd doesn't stack duplicate handlers.
+  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+    group = vim.api.nvim_create_augroup("NeoHerdrNotifier", { clear = true }),
+    callback = function()
+      if D.tab and vim.api.nvim_tabpage_is_valid(D.tab) then
+        reposition_status()
+      end
+    end,
+  })
 
   vim.api.nvim_create_autocmd("TabClosed", {
     callback = function()
@@ -638,6 +830,7 @@ local function build_tab(cfg)
           end
         end
         D.chat_bufs = {}
+        close_status()
         D.tab, D.win, D.buf, D.chat_win, D.main_win, D.chat_target = nil, nil, nil, nil, nil, nil
         D.help_win = nil
       end
@@ -736,6 +929,7 @@ function M.close()
     end
   end
   D.chat_bufs = {}
+  close_status()
   if M.is_open() then
     local n = vim.api.nvim_tabpage_get_number(D.tab)
     local ok = pcall(vim.cmd, n .. "tabclose")
