@@ -291,20 +291,21 @@ local function ensure_status_buf()
   return b
 end
 
--- Float geometry: sit just left of the chat window, overhanging the editor.
+-- Float geometry: anchored to the chat window so Neovim keeps it glued to the
+-- chat's left edge automatically — it follows moves AND resizes (editor width
+-- changes, help pane toggling, etc.) with no repositioning autocmd needed.
+-- anchor "NE" at the chat's top-left (row 0, col 0) places the pill's top-right
+-- corner there, so it sits just outside the chat, overhanging the editor.
 local function status_geometry()
   if not (D.chat_win and vim.api.nvim_win_is_valid(D.chat_win)) then
     return nil
   end
-  local pos = vim.api.nvim_win_get_position(D.chat_win) -- { row, col }
-  local col = pos[2] - NOTIFIER_W
-  if col < 0 then
-    col = 0
-  end
   return {
-    relative = "editor",
-    row = pos[1],
-    col = col,
+    relative = "win",
+    win = D.chat_win,
+    anchor = "NE",
+    row = 0,
+    col = 0,
     width = NOTIFIER_W,
     height = NOTIFIER_H,
     focusable = false,
@@ -387,16 +388,6 @@ local function open_status(cfg)
   vim.wo[win].winfixwidth = true
   vim.wo[win].winfixheight = true
   update_status()
-end
-
-local function reposition_status()
-  if not (D.status_win and vim.api.nvim_win_is_valid(D.status_win)) then
-    return
-  end
-  local g = status_geometry()
-  if g then
-    pcall(vim.api.nvim_win_set_config, D.status_win, g)
-  end
 end
 
 local function close_status()
@@ -806,18 +797,7 @@ local function build_tab(cfg)
   end
 
   style_separators(cfg)
-  open_status(cfg) -- Opera-GX-style notifier float, left of the chat
-
-  -- Keep the notifier glued to the chat's left edge as the editor width changes.
-  -- A cleared augroup means re-opening the herd doesn't stack duplicate handlers.
-  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
-    group = vim.api.nvim_create_augroup("NeoHerdrNotifier", { clear = true }),
-    callback = function()
-      if D.tab and vim.api.nvim_tabpage_is_valid(D.tab) then
-        reposition_status()
-      end
-    end,
-  })
+  open_status(cfg) -- Opera-GX-style notifier float, left of the chat (relative=win)
 
   vim.api.nvim_create_autocmd("TabClosed", {
     callback = function()

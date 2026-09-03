@@ -7,6 +7,7 @@
 
 local herdr = require("neo-herdr.herdr")
 local comments = require("neo-herdr.comments")
+local marks = require("neo-herdr.marks")
 
 local M = {}
 
@@ -311,20 +312,66 @@ end
 
 -- ── Comment capture / batch ──────────────────────────────────────────────────
 
-local function capture(range)
-  local bufname = vim.api.nvim_buf_get_name(0)
-  if bufname == "" then
-    notify("current buffer has no file", vim.log.levels.WARN)
+-- Resolve the real on-disk path for the current buffer, seeing through
+-- diffview:// and fugitive:// git-object buffers so `<leader>hc` works from
+-- EITHER diff pane (not just the working-tree side). Returns the absolute path
+-- or nil. The line number + snippet are still taken from the visible buffer, so
+-- they match exactly what you're looking at (the revision's content on the left
+-- side, the working tree on the right).
+local function resolve_buffer_file(buf)
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name == "" then
     return nil
   end
-  local file = vim.fn.fnamemodify(bufname, ":.")
+
+  if name:match("^fugitive://") then
+    local ok, real = pcall(vim.fn["fugitive#Real"], name)
+    if ok and type(real) == "string" and real ~= "" then
+      return real
+    end
+    return nil
+  end
+
+  if name:match("^diffview://") then
+    local ok, lib = pcall(require, "diffview.lib")
+    if not (ok and lib and lib.get_current_view) then
+      return nil
+    end
+    local view = lib.get_current_view()
+    local entry = view and (view.cur_entry or (view.panel and view.panel.cur_file))
+    if not entry then
+      return nil
+    end
+    if type(entry.absolute_path) == "string" and entry.absolute_path ~= "" then
+      return entry.absolute_path
+    end
+    -- Fall back to toplevel + relative path across diffview versions.
+    local top = (view.adapter and view.adapter.ctx and view.adapter.ctx.toplevel)
+      or (view.git_ctx and view.git_ctx.toplevel)
+    if top and type(entry.path) == "string" and entry.path ~= "" then
+      return top .. "/" .. entry.path
+    end
+    return nil
+  end
+
+  return name -- ordinary file buffer (incl. diffview's working-tree pane)
+end
+
+local function capture(range)
+  local buf = vim.api.nvim_get_current_buf()
+  local abs = resolve_buffer_file(buf)
+  if not abs then
+    notify("can't resolve a real file for this buffer (unsaved, or a git-diff view)", vim.log.levels.WARN)
+    return nil
+  end
+  local file = vim.fn.fnamemodify(abs, ":.")
   local s = range and range.s or vim.fn.line(".")
   local e = range and range.e or s
   if s > e then
     s, e = e, s
   end
   local snippet = {}
-  local raw = vim.api.nvim_buf_get_lines(0, s - 1, e, false)
+  local raw = vim.api.nvim_buf_get_lines(buf, s - 1, e, false)
   local max = M.config.snippet_max
   for i, l in ipairs(raw) do
     if i > max then
@@ -333,7 +380,7 @@ local function capture(range)
     end
     table.insert(snippet, l)
   end
-  return { file = file, s = s, e = e, snippet = snippet }
+  return { file = file, s = s, e = e, snippet = snippet, bufnr = buf }
 end
 
 function M.add_comment(opts)
@@ -349,6 +396,7 @@ function M.add_comment(opts)
     end
     c.note = note
     local n = comments.add(c)
+    marks.place(c) -- persist an inline marker until sent/cleared
     local loc = (c.e ~= c.s) and string.format("%s:%d-%d", c.file, c.s, c.e)
       or string.format("%s:%d", c.file, c.s)
     notify(string.format("added comment %d on %s", n, loc))
@@ -373,6 +421,7 @@ function M.send()
         -- Delivered to the agent (shows in its chat) — the review batch is done.
         notify(string.format("sent %d comment(s) to %s", n, target))
         comments.clear()
+        marks.clear() -- pending markers go away once sent
       else
         notify("send failed: " .. (out or "unknown"), vim.log.levels.ERROR)
       end
@@ -414,7 +463,37 @@ end
 function M.clear()
   local n = comments.count()
   comments.clear()
+  marks.clear()
   notify(string.format("cleared %d comment(s)", n))
+end
+
+-- ── Public API for companion packages (e.g. neo-reviewr) ─────────────────────
+-- Stable surface so a separate review UI can push comments into the same batch,
+-- reuse the inline-marker rendering, and hand off to the same send/clear flow.
+
+--- Add a fully-formed comment to the pending batch (no capture/prompt).
+--- c = { file, s, e?, snippet?, note }. Returns the batch index, or nil.
+function M.add_comment_data(c)
+  if type(c) ~= "table" or not c.file or not c.s or not c.note then
+    return nil
+  end
+  c.e = c.e or c.s
+  c.snippet = c.snippet or {}
+  return comments.add(c)
+end
+
+--- Read-only view of the pending comments (for a companion UI to re-render).
+function M.comments()
+  return comments.all()
+end
+
+--- Draw / clear the shared inline comment marker on an arbitrary buffer line.
+function M.place_marker(buf, line0, note)
+  return marks.place_line(buf, line0, note)
+end
+
+function M.clear_markers_in(buf)
+  marks.clear_buf(buf)
 end
 
 function M.pick_agent()

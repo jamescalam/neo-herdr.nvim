@@ -138,6 +138,19 @@ note** (see `default_format`); `<leader>hs` delivers the whole batch to the agen
 shown in the chat window — so it lands in the same conversation you're looking at
 — and clears the pending comments once the send succeeds.
 
+While a comment is **pending** (added but not yet sent) it persists inline in the
+code like a GitHub review comment: a gutter marker, a subtle highlight over the
+commented range, and the note shown as virtual lines beneath it. The marker
+tracks edits and disappears once the batch is sent (`<leader>hs`) or cleared
+(`<leader>hx`). Colors follow `NeoHerdrCommentSign/Head/Body/Line`.
+
+**Works with your diff viewer.** `<leader>hc` reviews best with **diffview.nvim**
+(`:DiffviewOpen`): open the diff, then comment on any hunk. It sees through
+`diffview://` and `fugitive://` git-object buffers, so you can comment from
+*either* pane — the filepath resolves to the real file, and the line/snippet come
+from exactly what you're looking at (the revision on the left, the working tree
+on the right). `gitsigns` works too (you're always in the real file buffer).
+
 Commands: `:NeoHerdrComment` (range-aware), `:NeoHerdrSend`,
 `:NeoHerdrMessage [text]`, `:NeoHerdrList`, `:NeoHerdrClear`,
 `:NeoHerdrPickAgent`, `:NeoHerdrRead`, `:NeoHerdrDashboard`, `:NeoHerdrChat`,
