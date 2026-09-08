@@ -2,22 +2,39 @@
 -- Every call shells out with vim.system (non-blocking) and returns results
 -- on the main loop via vim.schedule, so callers can touch the Neovim API freely.
 --
--- NOTE ON JSON: herdr's automation surface prints JSON for most commands, but
--- the exact schema of `agent list` is not pinned down in the public docs. All
--- schema assumptions live in `extract_agents` / `M.list` below so there is a
--- single place to adjust once we've seen real output on your machine.
+-- All commands run against ONE herdr session (config.session, default "nvim")
+-- by prefixing `--session <name>`; M.argv builds that argv so attach/terminal
+-- code uses the exact same session as the request/response calls.
+--
+-- Errors: herdr prints `{"id":..,"error":{"code":..,"message":..}}` on stderr
+-- with exit 1. M.errinfo decodes that so callers can branch on `code`
+-- (agent_not_found, agent_pane_busy, agent_name_taken, server_not_running…).
 
 local M = {}
 
-local config = { herdr_cmd = "herdr" }
+local config = { herdr_cmd = "herdr", session = nil }
 
 function M.setup(cfg)
   config = vim.tbl_deep_extend("force", config, cfg or {})
 end
 
+function M.session()
+  return config.session
+end
+
+--- Full argv for a herdr invocation, including the session selector.
+function M.argv(args)
+  local cmd = { config.herdr_cmd }
+  if config.session and config.session ~= "" then
+    table.insert(cmd, "--session")
+    table.insert(cmd, config.session)
+  end
+  vim.list_extend(cmd, args)
+  return cmd
+end
+
 local function run(args, on_done)
-  local cmd = vim.list_extend({ config.herdr_cmd }, args)
-  vim.system(cmd, { text = true }, function(res)
+  vim.system(M.argv(args), { text = true }, function(res)
     vim.schedule(function()
       on_done(res)
     end)
@@ -37,6 +54,43 @@ local function decode(str)
     return nil
   end
   return val
+end
+
+--- Decode a failed result into { code, message, text }. `text` is a short
+--- human string ("code: message"), suitable for vim.notify.
+function M.errinfo(res)
+  local info = { code = nil, message = nil, text = nil }
+  local raw = (res.stderr and res.stderr ~= "") and res.stderr or res.stdout or ""
+  -- herdr may print several JSON lines; take the first that carries an error.
+  for line in raw:gmatch("[^\r\n]+") do
+    local d = decode(line)
+    if d and type(d.error) == "table" then
+      info.code = d.error.code
+      info.message = d.error.message
+      break
+    end
+  end
+  if not info.code and raw:match("%S") then
+    info.message = vim.trim(raw)
+  end
+  if info.code then
+    info.text = info.code .. (info.message and (": " .. info.message) or "")
+  else
+    info.text = info.message or ("exit " .. tostring(res.code))
+  end
+  return info
+end
+
+--- Extract the error code prefix from a string produced by errinfo().text.
+function M.code_of(err)
+  if type(err) ~= "string" then
+    return nil
+  end
+  return err:match("^([%w_]+):")
+end
+
+local function fail(res)
+  return M.errinfo(res).text
 end
 
 -- Pull a list of agents out of whatever `agent list` returned. Handles the
@@ -106,11 +160,30 @@ local function parse_agent_lines(stdout)
   return out
 end
 
+--- Server status. cb({ running, socket, version }, err). `herdr status --json`
+--- answers even when nothing is running, so this is the cheap liveness probe.
+function M.status(cb)
+  run({ "status", "--json" }, function(res)
+    local d = decode(res.stdout)
+    local s = d and d.server
+    if type(s) ~= "table" then
+      cb(nil, fail(res))
+      return
+    end
+    cb({
+      running = s.running == true or s.status == "running",
+      socket = s.socket,
+      version = s.version,
+      raw = d,
+    }, nil)
+  end)
+end
+
 --- List live agents. cb(agents, err). Each agent: { name, pane, state, raw }.
 function M.list(cb)
   run({ "agent", "list" }, function(res)
     if not ok(res) then
-      cb(nil, res.stderr ~= "" and res.stderr or ("exit " .. tostring(res.code)))
+      cb(nil, fail(res))
       return
     end
     local agents = extract_agents(decode(res.stdout))
@@ -125,7 +198,7 @@ end
 function M.agents_raw(cb)
   run({ "agent", "list" }, function(res)
     if not ok(res) then
-      cb(nil, res.stderr ~= "" and res.stderr or ("exit " .. tostring(res.code)))
+      cb(nil, fail(res))
       return
     end
     local decoded = decode(res.stdout)
@@ -140,11 +213,25 @@ function M.agents_raw(cb)
   end)
 end
 
+--- Names currently in use by live agents (for picking a unique default).
+function M.agent_names(cb)
+  M.agents_raw(function(list)
+    local names = {}
+    for _, a in ipairs(list or {}) do
+      local n = a.name or a.agent_name
+      if type(n) == "string" and n ~= "" then
+        names[n] = true
+      end
+    end
+    cb(names)
+  end)
+end
+
 --- Raw workspace objects for the dashboard's CLI-poll path.
 function M.workspaces(cb)
   run({ "workspace", "list" }, function(res)
     if not ok(res) then
-      cb(nil, res.stderr ~= "" and res.stderr or ("exit " .. tostring(res.code)))
+      cb(nil, fail(res))
       return
     end
     local decoded = decode(res.stdout)
@@ -170,7 +257,7 @@ function M.prompt(target, text, opts, cb)
     end
   end
   run(args, function(res)
-    cb(ok(res), ok(res) and res.stdout or res.stderr)
+    cb(ok(res), ok(res) and res.stdout or fail(res))
   end)
 end
 
@@ -187,7 +274,7 @@ function M.read(target, source, lines, cb)
   end
   run(args, function(res)
     if not ok(res) then
-      cb(nil, res.stderr ~= "" and res.stderr or ("exit " .. tostring(res.code)))
+      cb(nil, fail(res))
       return
     end
     local d = decode(res.stdout)
@@ -199,24 +286,26 @@ end
 --- Close a single pane/chat. cb(ok, out).
 function M.close_pane(pane_id, cb)
   run({ "pane", "close", pane_id }, function(res)
-    cb(ok(res), ok(res) and res.stdout or res.stderr)
+    cb(ok(res), ok(res) and res.stdout or fail(res))
   end)
 end
 
 --- Rename an agent/chat (its display title). cb(ok, out).
 function M.rename_agent(target, name, cb)
   run({ "agent", "rename", target, name }, function(res)
-    cb(ok(res), ok(res) and res.stdout or res.stderr)
+    cb(ok(res), ok(res) and res.stdout or fail(res))
   end)
 end
 
 --- Create a tab (new pane). opts = { workspace_id, focus }. cb(info, err) where
 --- info = { tab_id, pane_id, raw } — pane_id is the new tab's root pane, which
---- `agent start` targets (once its shell is ready; see M.wait_pane_ready).
+--- `agent start` targets (once its shell is ready; see M.start_agent's retry).
 function M.create_tab(opts, cb)
   opts = opts or {}
   local args = { "tab", "create" }
-  if opts.focus ~= false then
+  if opts.focus == false then
+    table.insert(args, "--no-focus")
+  else
     table.insert(args, "--focus")
   end
   if opts.workspace_id then
@@ -225,7 +314,7 @@ function M.create_tab(opts, cb)
   end
   run(args, function(res)
     if not ok(res) then
-      cb(nil, res.stderr ~= "" and res.stderr or ("exit " .. tostring(res.code)))
+      cb(nil, fail(res))
       return
     end
     local d = decode(res.stdout)
@@ -240,29 +329,50 @@ function M.create_tab(opts, cb)
   end)
 end
 
---- Poll until a pane's shell has reached its prompt (a non-empty terminal
---- title), then cb(ready:bool). A freshly-created tab's pane isn't an
---- "available shell" for `agent start` until this happens (~0.5s).
-function M.wait_pane_ready(pane_id, cb, _attempt)
-  _attempt = _attempt or 1
-  M.panes(function(panes)
-    for _, p in ipairs(panes or {}) do
-      if (p.pane_id or p.pane) == pane_id then
-        local title = p.terminal_title_stripped or p.terminal_title
-        if title and title ~= "" then
-          cb(true)
-          return
-        end
-        break
-      end
-    end
-    if _attempt >= 20 then
-      cb(false)
+--- The whole live session in one call: { workspaces, tabs, panes, agents, … }.
+--- cb(snapshot, err).
+function M.snapshot(cb)
+  run({ "api", "snapshot" }, function(res)
+    if not ok(res) then
+      cb(nil, fail(res))
       return
     end
-    vim.defer_fn(function()
-      M.wait_pane_ready(pane_id, cb, _attempt + 1)
-    end, 250)
+    local d = decode(res.stdout)
+    local snap = d and d.result and (d.result.snapshot or d.result)
+    if type(snap) ~= "table" or not snap.panes then
+      cb(nil, "unexpected snapshot shape")
+      return
+    end
+    cb(snap, nil)
+  end)
+end
+
+--- Create a workspace (with its first tab + root pane). opts = { cwd, focus }.
+--- cb(info, err) where info = { workspace_id, tab_id, pane_id, raw }.
+function M.create_workspace(opts, cb)
+  opts = opts or {}
+  local args = { "workspace", "create" }
+  if opts.cwd then
+    table.insert(args, "--cwd")
+    table.insert(args, opts.cwd)
+  end
+  if opts.focus == false then
+    table.insert(args, "--no-focus")
+  end
+  run(args, function(res)
+    if not ok(res) then
+      cb(nil, fail(res))
+      return
+    end
+    local d = decode(res.stdout)
+    local r = (d and d.result) or {}
+    local ws, tab, root = r.workspace or {}, r.tab or {}, r.root_pane or {}
+    cb({
+      workspace_id = ws.workspace_id or ws.id or root.workspace_id,
+      tab_id = tab.tab_id or root.tab_id,
+      pane_id = root.pane_id,
+      raw = r,
+    }, nil)
   end)
 end
 
@@ -270,7 +380,7 @@ end
 function M.panes(cb)
   run({ "pane", "list" }, function(res)
     if not ok(res) then
-      cb(nil, res.stderr ~= "" and res.stderr or ("exit " .. tostring(res.code)))
+      cb(nil, fail(res))
       return
     end
     local d = decode(res.stdout)
@@ -278,17 +388,38 @@ function M.panes(cb)
   end)
 end
 
---- Start an interactive agent in an existing (shell-ready) pane. cb(ok, out).
---- timeout_ms is herdr's interactive-readiness wait (default 30000; >3000).
-function M.start_agent(pane_id, kind, name, timeout_ms, cb)
+--- Start an interactive agent in an existing shell pane. cb(ok, out, code).
+--- herdr answers `agent_pane_busy` until the pane's shell is at its prompt
+--- (measured: busy at ~10ms after `tab create`, available by ~250ms), so we
+--- retry that one code every 250ms for up to `opts.busy_retry_ms` (default 5s).
+--- opts = { timeout_ms = herdr's readiness wait (>3000), busy_retry_ms, args = {…} }
+function M.start_agent(pane_id, kind, name, opts, cb)
+  opts = opts or {}
   local args = { "agent", "start", name, "--kind", kind, "--pane", pane_id }
-  if timeout_ms then
+  if opts.timeout_ms then
     table.insert(args, "--timeout")
-    table.insert(args, tostring(timeout_ms))
+    table.insert(args, tostring(opts.timeout_ms))
   end
-  run(args, function(res)
-    cb(ok(res), ok(res) and res.stdout or res.stderr)
-  end)
+  if opts.args and #opts.args > 0 then
+    table.insert(args, "--")
+    vim.list_extend(args, opts.args)
+  end
+  local deadline = vim.uv.now() + (opts.busy_retry_ms or 5000)
+  local function attempt()
+    run(args, function(res)
+      if ok(res) then
+        cb(true, res.stdout, nil)
+        return
+      end
+      local e = M.errinfo(res)
+      if e.code == "agent_pane_busy" and vim.uv.now() < deadline then
+        vim.defer_fn(attempt, 250)
+        return
+      end
+      cb(false, e.text, e.code)
+    end)
+  end
+  attempt()
 end
 
 --- Send raw keys to an agent (e.g. { "esc" } or { "ctrl+c" }).
@@ -296,8 +427,29 @@ function M.send_keys(target, keys, cb)
   local args = { "agent", "send-keys", target }
   vim.list_extend(args, keys)
   run(args, function(res)
-    cb(ok(res), ok(res) and res.stdout or res.stderr)
+    cb(ok(res), ok(res) and res.stdout or fail(res))
   end)
+end
+
+--- Stop the server this session talks to. cb(ok, out).
+function M.server_stop(cb)
+  run({ "server", "stop" }, function(res)
+    cb(ok(res), ok(res) and res.stdout or fail(res))
+  end)
+end
+
+--- Synchronous variants for VimLeavePre, where async callbacks never run.
+function M.server_stop_sync(timeout_ms)
+  local res = vim.system(M.argv({ "server", "stop" }), { text = true }):wait(timeout_ms or 3000)
+  return res and res.code == 0, res and fail(res) or "timeout"
+end
+
+function M.agents_raw_sync(timeout_ms)
+  local res = vim.system(M.argv({ "agent", "list" }), { text = true }):wait(timeout_ms or 2000)
+  if not res or res.code ~= 0 then
+    return nil
+  end
+  return raw_agents(decode(res.stdout)) or {}
 end
 
 return M

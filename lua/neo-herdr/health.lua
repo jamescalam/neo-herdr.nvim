@@ -10,7 +10,9 @@ function M.check()
 
   start("neo-herdr")
 
-  local cmd = require("neo-herdr").config.herdr_cmd or "herdr"
+  local nh = require("neo-herdr")
+  local herdr = require("neo-herdr.herdr")
+  local cmd = nh.config.herdr_cmd or "herdr"
   if vim.fn.executable(cmd) == 1 then
     ok("`" .. cmd .. "` found on PATH")
   else
@@ -18,26 +20,43 @@ function M.check()
     return
   end
 
-  local res = vim.system({ cmd, "agent", "list" }, { text = true }):wait()
+  local session = herdr.session()
+  ok("herdr session: " .. (session or "(default)") .. "  — argv: " .. table.concat(herdr.argv({ "…" }), " "))
+
+  local st = vim.system(herdr.argv({ "status", "--json" }), { text = true }):wait()
+  local decoded = st.stdout and st.stdout ~= "" and select(2, pcall(vim.json.decode, st.stdout)) or nil
+  if type(decoded) == "table" and type(decoded.server) == "table" then
+    if decoded.server.running then
+      ok("server running (v" .. tostring(decoded.server.version) .. ") at " .. tostring(decoded.server.socket))
+    else
+      warn("server not running at " .. tostring(decoded.server.socket), {
+        "The dashboard starts one automatically when `server.autostart` is true (default).",
+        "Or run: " .. table.concat(herdr.argv({ "server" }), " "),
+      })
+    end
+  else
+    warn("`status --json` did not return JSON: " .. tostring(st.stderr or st.stdout))
+  end
+
+  local res = vim.system(herdr.argv({ "agent", "list" }), { text = true }):wait()
   if res.code == 0 then
-    ok("`" .. cmd .. " agent list` succeeded")
+    ok("`agent list` succeeded")
     if res.stdout and res.stdout ~= "" then
       ok("agent list output:\n" .. res.stdout)
     else
-      warn("agent list returned no output (no live agents, or run inside a herdr workspace)")
+      warn("agent list returned no output")
     end
   else
-    warn("`agent list` failed (code " .. tostring(res.code) .. "): " .. (res.stderr or ""))
+    warn("`agent list` failed: " .. herdr.errinfo(res).text)
   end
 
   -- Socket (used by the dashboard for live state).
-  local sock = require("neo-herdr.socket").resolve_path(require("neo-herdr").config.dashboard.socket_path)
+  local sock = require("neo-herdr.socket").resolve_path(nh.config.dashboard.socket_path, session)
   if vim.uv.fs_stat(sock) then
     ok("herdr socket present: " .. sock)
   else
     warn("herdr socket not found at " .. sock, {
-      "Dashboard falls back to CLI polling.",
-      "Set $HERDR_SOCKET_PATH or run nvim from inside a herdr session for live events.",
+      "Dashboard falls back to CLI polling until the server is up.",
     })
   end
 end

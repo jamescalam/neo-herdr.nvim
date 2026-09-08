@@ -42,17 +42,34 @@ M.config = {
   snippet_max = 40,
   read = { source = "recent-unwrapped", lines = 200 },
   format = default_format,
+  -- The herdr server behind the herd tab. The plugin talks to a DEDICATED
+  -- session so it never fights the user's own `herdr` TUI over one server.
+  server = {
+    session = "nvim", -- nil = herdr's default session (shared with the TUI)
+    autostart = true, -- start a headless server on open if none is running
+    autostop = "owned", -- "owned" (only one we started) | "always" | "never"
+    confirm = true, -- confirm before stopping while agents are working/blocked
+    start_timeout = 10000, -- ms
+  },
+  agent_start = {
+    timeout = 60000, -- herdr's interactive-readiness wait (>3000)
+    busy_retry_ms = 5000, -- retry `agent_pane_busy` on a fresh pane this long
+    default_kind = "claude",
+  },
   dashboard = {
     side = "right", -- herd area (chat+nav) on the "right" or "left"; editor gets the rest
-    herd_width = 0.30, -- herd area as a fraction of the tab (<=1) or absolute columns (>1)
-    nav_width = 0.30, -- nav as a fraction of the herd area (<=1) or absolute columns (>1)
-    nav_min = 12, -- floor for the nav column, in columns (keeps it readable)
+    herd_width = 0.34, -- herd area as a fraction of the tab (<=1) or absolute columns (>1)
+    nav_width = 0.40, -- nav as a fraction of the herd area (<=1) or absolute columns (>1)
+    nav_min = 16, -- floor for the nav column, in columns (16 keeps ~10 characters of a title visible)
+    chat_min = 40, -- floor for the chat window, in columns (enough to keep terminal text readable)
     editor = true, -- include an editor/cursor window taking the remaining width
     hide_tab = true, -- hide the herd tabpage from the built-in tabline (see README)
-    help = true, -- show the keybindings help pane under the chat (toggle with ?)
-    notifier = true, -- Opera-GX-style notifier float (blocked/working/done circles)
+    help = true, -- keybinding bar under chat+nav (toggle with ?)
+    notifier = true, -- Opera-GX-style notifier float (blocked/working/done icons)
+    notifier_size = "large", -- "large" (3x2 block icons) | "small" (single ●/○ glyphs)
+    notifier_blink = 800, -- ms per phase of the blocked icon's slow flash; false = steady
     use_socket = true, -- prefer socket; falls back to CLI poll
-    socket_path = nil, -- override $HERDR_SOCKET_PATH resolution
+    socket_path = nil, -- override socket path resolution
     auto_refresh = true, -- timer + manual; false = manual only
     poll_interval = 4000, -- ms (backstop / CLI fallback)
     chat_header = true, -- winbar on the chat window: workspace › agent + status
@@ -61,9 +78,21 @@ M.config = {
       vert = "┊", -- set false on `dotted` to keep solid separators
     },
   },
+  -- The floating directory picker behind `w` / :NeoHerdrNewWorkspace (native:
+  -- a prompt over a fuzzy-filtered list). false = plain vim.ui.input prompt.
+  dir_picker = {
+    root = nil, -- starting directory; nil = Neovim's cwd
+    depth = 3, -- how deep below the root to list
+    hidden = false, -- include dot-directories
+    ignore = { ".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "dist", "build", "target" },
+    max = 5000, -- stop listing past this many directories
+  },
   attach = {
     detach_hint = true,
-    attach_args = {}, -- e.g. { "--takeover" }
+    takeover = true, -- `--takeover`: evict a lingering attach client instead of failing
+    attach_args = {},
+    mouse_copy = true, -- mouse-select in a herd window copies to the system clipboard
+    mouse_copy_clean = true, -- strip shared indent + trailing padding from mouse copies
     -- Window navigation out of the chat terminal. Each key leaves terminal mode
     -- and replays through your own normal-mode mappings; <C-w> is Vim's window
     -- prefix. Add directional keys (e.g. "<C-h>") to `keys`, or enable = false.
@@ -107,7 +136,7 @@ local function resolve_agent(cb)
       return
     end
     if #agents == 1 then
-      cb(agents[1].name or agents[1].pane)
+      cb(agents[1].pane or agents[1].name)
       return
     end
     vim.ui.select(agents, {
@@ -121,7 +150,7 @@ local function resolve_agent(cb)
       end,
     }, function(choice)
       if choice then
-        cb(choice.name or choice.pane)
+        cb(choice.pane or choice.name)
       end
     end)
   end)
@@ -201,12 +230,16 @@ end
 
 --- Rename a chat's display title (herdr agent rename).
 function M.rename_chat(agent)
-  local target = type(agent) == "table" and (agent.name or agent.pane_id) or agent
+  local target = type(agent) == "table" and (agent.pane_id or agent.name) or agent
   if not target or target == "" then
     notify("no target to rename", vim.log.levels.WARN)
     return
   end
-  local cur = type(agent) == "table" and (agent.name or agent.title or "") or ""
+  if type(agent) == "table" and agent.is_shell then
+    notify("this pane has no agent to rename — start one first (<CR>)", vim.log.levels.WARN)
+    return
+  end
+  local cur = type(agent) == "table" and (agent.name or "") or ""
   vim.ui.input({ prompt = "Rename chat to: ", default = cur }, function(name)
     if not name or name == "" then
       return
@@ -222,6 +255,8 @@ function M.rename_chat(agent)
   end)
 end
 
+-- ── Starting agents (new chat / start in pane) ──────────────────────────────
+
 -- herdr agent names must be lowercase [a-z0-9_-], 1-32 chars, starting with a
 -- letter. Coerce free-form input into a valid name (else the CLI rejects it).
 local function sanitize_name(s)
@@ -229,26 +264,79 @@ local function sanitize_name(s)
   return s
 end
 
--- Start an agent in a freshly created tab's pane, waiting for its shell to reach
--- a prompt first — a new tab isn't an "available shell" for ~0.5s.
-local function start_agent_in_pane(pane_id, kind, name)
-  herdr.wait_pane_ready(pane_id, function(ready)
-    if not ready then
-      notify("the new tab's shell never reached a prompt", vim.log.levels.ERROR)
+-- First of base, base-2, base-3… not in `taken`.
+local function unique_name(base, taken)
+  base = sanitize_name(base)
+  if base == "" then
+    base = "agent"
+  end
+  if not taken[base] then
+    return base
+  end
+  for i = 2, 99 do
+    local n = (base:sub(1, 32 - (#tostring(i) + 1))) .. "-" .. i
+    if not taken[n] then
+      return n
+    end
+  end
+  return base .. "-" .. tostring(os.time() % 1000)
+end
+
+local function explain_start_error(name, code, out)
+  if code == "agent_name_taken" then
+    return "name '" .. name .. "' is already taken — pick another"
+  elseif code == "invalid_agent_name" then
+    return "invalid agent name '" .. name .. "' (a-z, 0-9, -, _; must start with a letter)"
+  elseif code == "agent_pane_busy" then
+    return "that pane is not an idle shell (something is still running in it)"
+  elseif code == "agent_not_ready" then
+    return "the agent started but never became ready — open the pane to see why"
+  end
+  return "agent start failed: " .. tostring(out)
+end
+
+-- Start `kind` as `name` in `pane_id`, retrying herdr's transient
+-- `agent_pane_busy` on a fresh pane, then open the chat on success.
+local function start_agent_in_pane(pane_id, kind, name, on_done)
+  local cfg = M.config.agent_start or {}
+  notify("starting " .. name .. " (" .. kind .. ") in " .. pane_id .. "…")
+  herdr.start_agent(pane_id, kind, name, {
+    timeout_ms = cfg.timeout or 60000,
+    busy_retry_ms = cfg.busy_retry_ms or 5000,
+  }, function(ok, out, code)
+    local dash = require("neo-herdr.dashboard")
+    if ok then
+      notify("started " .. name .. " (" .. kind .. ")")
+      dash.refresh()
+      dash.open_pane(pane_id)
+    else
+      notify(explain_start_error(name, code, out), vim.log.levels.ERROR)
+      dash.refresh()
+    end
+    if on_done then
+      on_done(ok)
+    end
+  end)
+end
+
+-- Ask for kind + name (name defaults to a unique derivative of the kind), then
+-- cb(kind, name). Cancelling either prompt aborts.
+local function ask_kind_and_name(default_kind, cb)
+  vim.ui.input({ prompt = "Agent kind: ", default = default_kind }, function(kind)
+    if not kind or kind == "" then
       return
     end
-    herdr.start_agent(pane_id, kind, name, 60000, function(ok, out)
-      out = out or ""
-      if ok then
-        notify("started " .. name .. " (" .. kind .. ")")
-        require("neo-herdr.dashboard").refresh()
-      elseif out:find("agent_name_taken") then
-        notify("name '" .. name .. "' is already taken — pick another", vim.log.levels.ERROR)
-      elseif out:find("invalid_agent_name") then
-        notify("invalid agent name '" .. name .. "' (use a-z, 0-9, -, _)", vim.log.levels.ERROR)
-      else
-        notify("agent start failed: " .. out, vim.log.levels.ERROR)
-      end
+    kind = vim.trim(kind)
+    herdr.agent_names(function(taken)
+      local suggested = unique_name(kind, taken)
+      vim.ui.input({ prompt = "Name: ", default = suggested }, function(rawname)
+        local name = sanitize_name((rawname and rawname ~= "") and rawname or suggested)
+        if name == "" then
+          notify("could not derive a valid agent name", vim.log.levels.ERROR)
+          return
+        end
+        cb(kind, name)
+      end)
     end)
   end)
 end
@@ -257,25 +345,81 @@ end
 --- (optional) = the hovered row, used only to default the kind/workspace.
 function M.new_chat(ctx)
   local ws = type(ctx) == "table" and ctx.workspace_id or nil
-  local default_kind = (type(ctx) == "table" and not ctx.is_shell and ctx.program) or "claude"
-  vim.ui.input({ prompt = "Agent kind: ", default = default_kind }, function(kind)
-    if not kind or kind == "" then
-      return
-    end
-    vim.ui.input({ prompt = "Name: ", default = kind }, function(rawname)
-      local name = sanitize_name((rawname and rawname ~= "") and rawname or kind)
-      if name == "" then
-        notify("could not derive a valid agent name", vim.log.levels.ERROR)
+  local default_kind = (type(ctx) == "table" and not ctx.is_shell and ctx.program)
+    or (M.config.agent_start and M.config.agent_start.default_kind)
+    or "claude"
+  ask_kind_and_name(default_kind, function(kind, name)
+    herdr.create_tab({ workspace_id = ws, focus = true }, function(info, err)
+      if info and info.pane_id then
+        start_agent_in_pane(info.pane_id, kind, name)
         return
       end
-      herdr.create_tab({ workspace_id = ws, focus = true }, function(info, err)
-        if not info or not info.pane_id then
-          notify("tab create failed: " .. (err or "no pane id"), vim.log.levels.ERROR)
+      if herdr.code_of(err) ~= "workspace_not_found" then
+        notify("tab create failed: " .. (err or "no pane id"), vim.log.levels.ERROR)
+        return
+      end
+      -- A fresh (dedicated) session has no workspace yet: make one in the
+      -- current directory; its root pane is the new chat's pane.
+      local cwd = vim.fn.getcwd()
+      notify("no herdr workspace yet — creating one in " .. cwd)
+      herdr.create_workspace({ cwd = cwd, focus = true }, function(winfo, werr)
+        if not winfo or not winfo.pane_id then
+          notify("workspace create failed: " .. (werr or "no pane id"), vim.log.levels.ERROR)
           return
         end
+        require("neo-herdr.dashboard").refresh()
+        start_agent_in_pane(winfo.pane_id, kind, name)
+      end)
+    end)
+  end)
+end
+
+--- Create a new herdr workspace in `dir` (asked for if nil, defaulting to the
+--- current directory), then start an agent in its root pane. Cancelling the
+--- kind prompt leaves the workspace as a plain terminal row (<CR> starts one
+--- later).
+function M.new_workspace(dir)
+  local function go(path)
+    if not path or path == "" then
+      return
+    end
+    path = vim.fn.fnamemodify(vim.fn.expand(path), ":p"):gsub("/$", "")
+    if vim.fn.isdirectory(path) ~= 1 then
+      notify("not a directory: " .. path, vim.log.levels.ERROR)
+      return
+    end
+    herdr.create_workspace({ cwd = path, focus = true }, function(info, err)
+      if not info or not info.pane_id then
+        notify("workspace create failed: " .. (err or "no pane id"), vim.log.levels.ERROR)
+        return
+      end
+      notify("created workspace " .. (info.workspace_id or "?") .. " in " .. path)
+      require("neo-herdr.dashboard").refresh()
+      local default_kind = (M.config.agent_start and M.config.agent_start.default_kind) or "claude"
+      ask_kind_and_name(default_kind, function(kind, name)
         start_agent_in_pane(info.pane_id, kind, name)
       end)
     end)
+  end
+  if dir and dir ~= "" then
+    go(dir)
+  elseif M.config.dir_picker == false then
+    vim.ui.input({ prompt = "Workspace directory: ", default = vim.fn.getcwd(), completion = "dir" }, go)
+  else
+    local opts = vim.tbl_extend("force", { title = "New workspace" }, M.config.dir_picker or {})
+    require("neo-herdr.dirpick").pick(opts, go)
+  end
+end
+
+--- Turn an existing shell pane (a "terminal" row) into an agent chat.
+function M.start_chat_in_pane(a)
+  if type(a) ~= "table" or not a.pane_id then
+    notify("no pane to start an agent in", vim.log.levels.WARN)
+    return
+  end
+  local default_kind = (M.config.agent_start and M.config.agent_start.default_kind) or "claude"
+  ask_kind_and_name(default_kind, function(kind, name)
+    start_agent_in_pane(a.pane_id, kind, name)
   end)
 end
 
@@ -517,7 +661,7 @@ function M.pick_agent()
       end,
     }, function(choice)
       if choice then
-        pinned_agent = choice.name or choice.pane
+        pinned_agent = choice.pane or choice.name
         notify("target agent pinned: " .. pinned_agent)
       end
     end)
@@ -534,7 +678,7 @@ function M.read_agent()
   end)
 end
 
--- ── Dashboard / terminal facades ─────────────────────────────────────────────
+-- ── Dashboard / terminal / server facades ────────────────────────────────────
 
 function M.dashboard()
   require("neo-herdr.dashboard").toggle(M.config.dashboard)
@@ -564,9 +708,49 @@ function M.tile()
     end
     local targets = {}
     for _, a in ipairs(agents) do
-      table.insert(targets, a.name or a.pane)
+      table.insert(targets, a.pane or a.name)
     end
     require("neo-herdr.attach").tile(targets)
+  end)
+end
+
+function M.server_start()
+  require("neo-herdr.dashboard").start_server()
+end
+
+function M.server_stop()
+  local server = require("neo-herdr.server")
+  server.stop(function(ok, out)
+    if ok then
+      notify("herdr server stopped")
+      require("neo-herdr.dashboard").refresh()
+    else
+      notify("server stop failed: " .. tostring(out), vim.log.levels.ERROR)
+    end
+  end)
+end
+
+function M.server_status()
+  local server = require("neo-herdr.server")
+  server.status(function(st, err)
+    if not st then
+      notify("status failed: " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    local s = M.config.server.session or "(default)"
+    if st.running then
+      notify(
+        "server running (session "
+          .. s
+          .. ", v"
+          .. tostring(st.version)
+          .. ") at "
+          .. tostring(st.socket)
+          .. (server.owned() and " — started by this nvim" or "")
+      )
+    else
+      notify("server not running (session " .. s .. ") — would use " .. tostring(st.socket), vim.log.levels.WARN)
+    end
   end)
 end
 
@@ -615,6 +799,21 @@ local function register(cfg)
   cmd("NeoHerdrTile", function()
     M.tile()
   end, { desc = "Tile all agents as terminal panes" })
+  cmd("NeoHerdrNewChat", function()
+    M.new_chat()
+  end, { desc = "Create a tab and start an agent in it" })
+  cmd("NeoHerdrNewWorkspace", function(a)
+    M.new_workspace(a.args ~= "" and a.args or nil)
+  end, { nargs = "?", complete = "dir", desc = "Create a herdr workspace in a directory and start an agent" })
+  cmd("NeoHerdrServerStart", function()
+    M.server_start()
+  end, { desc = "Start the herdr server for the plugin's session" })
+  cmd("NeoHerdrServerStop", function()
+    M.server_stop()
+  end, { desc = "Stop the herdr server for the plugin's session (kills its panes)" })
+  cmd("NeoHerdrServerStatus", function()
+    M.server_status()
+  end, { desc = "Show the plugin's herdr server status" })
 
   vim.api.nvim_create_autocmd("VimLeavePre", {
     callback = function()
@@ -669,8 +868,11 @@ function M.setup(opts)
   if opts and opts.format then
     M.config.format = opts.format
   end
-  herdr.setup({ herdr_cmd = M.config.herdr_cmd })
-  require("neo-herdr.attach").setup(vim.tbl_extend("force", { herdr_cmd = M.config.herdr_cmd }, M.config.attach))
+  local session = M.config.server and M.config.server.session or nil
+  herdr.setup({ herdr_cmd = M.config.herdr_cmd, session = session })
+  require("neo-herdr.socket").setup({ session = session })
+  require("neo-herdr.server").setup(M.config.server)
+  require("neo-herdr.attach").setup(M.config.attach)
   register(M.config)
 end
 
