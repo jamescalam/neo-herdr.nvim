@@ -16,16 +16,23 @@ leaving your editor. Two planes, each doing what it's best at:
 - `herdr` on `PATH` (0.8.0+). The plugin starts and stops its own headless
   server (see below); live events ride the socket, with CLI polling as backstop.
 
-## Install (lazy.nvim)
+## Install
+
+[lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
 {
-  dir = "~/Documents/aurelio/neo-herdr.nvim",
-  name = "neo-herdr",
+  "jamescalam/neo-herdr.nvim",
   lazy = false,
-  config = function() require("neo-herdr").setup() end,
+  config = function()
+    require("neo-herdr").setup()
+  end,
 }
 ```
+
+Pin a tag with `version = "v0.x"` if you prefer tagged releases to `main`.
+For a local checkout while hacking on it, swap the first line for
+`dir = "~/path/to/neo-herdr.nvim", name = "neo-herdr",`.
 
 ## The herd server (dedicated session)
 
